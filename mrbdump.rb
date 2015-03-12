@@ -1,5 +1,7 @@
 #!/usr/bin/env ruby
 
+$mrb_version = 3
+
 class MrbHeader
   attr_accessor :identifier
   attr_accessor :binary_version
@@ -26,6 +28,7 @@ end
 class IREP
   attr_accessor :rite_version
   attr_accessor :bytelen
+  attr_accessor :nlocals
   attr_accessor :iseq
   attr_accessor :pool
   attr_accessor :syms
@@ -33,6 +36,7 @@ class IREP
   attr_accessor :plen
   attr_accessor :rlen        # number of child ireps
   attr_accessor :debug_info
+  attr_accessor :lv
 
   def initialize
     @iseq = []
@@ -40,6 +44,7 @@ class IREP
     @syms = []
     @reps = []
     @debug_info = nil
+    @lv = []
   end
 
   def iseq_add(str)
@@ -56,15 +61,16 @@ class IREP
 
   def read bbuf
     i = 0  #XXX
+    start_pos = bbuf.pos
 
     # irep header
     record_size = bbuf.bin32
-    nlocals = bbuf.bin16
+    self.nlocals = bbuf.bin16
     nregs = bbuf.bin16
     self.rlen = bbuf.bin16
 
     puts "IREP Record Size: #{record_size}"
-    puts "Number of Local Variables: #{nlocals}"
+    puts "Number of Local Variables: #{self.nlocals}"
     puts "Number of Register Variables: #{nregs}"
     puts "Number of Child IREPs: #{self.rlen}"
 
@@ -112,6 +118,20 @@ class IREP
     self.reps.each { |irep|
       irep.read_debug_info bbuf, filenames
     }
+  end
+
+  def read_lv_record bbuf
+    (@nlocals-1).times { |i|
+      sym_idx = bbuf.bin16
+      if sym_idx == 0xffff
+        bbuf.bin16
+        @lv[i] = [ nil, 0 ]
+      else
+        r = bbuf.bin16
+        @lv[i] = [ syms[sym_idx], r ]
+      end
+    }
+    @reps.each { |irep| irep.read_lv_record bbuf }
   end
 end
 
@@ -279,7 +299,7 @@ class MDB
   @@op << lambda { |v| "OP_AREF\tR%d\tR%d\t%d" % [ v[:A], v[:B], v[:C] ] }
   @@op << lambda { |v| "OP_ASET\tR%d\tR%d\t%d" % [ v[:A], v[:B], v[:C] ] }
   @@op << lambda { |v| "OP_APOST\tR%d\t%d\t%d" % [ v[:A], v[:B], v[:C] ] }
-  @@op << lambda { |v| "OP_STRING\tR%d\t%d" % [ v[:A], v[:n]+v[:Bx] ] }
+  @@op << lambda { |v| "OP_STRING\tR%d\tpool(%d)" % [ v[:A], v[:n]+v[:Bx] ] }
   @@op << lambda { |v| "OP_STRCAT\tR%d\tR%d" % [ v[:A], v[:B] ] }
   @@op << lambda { |v| "OP_HASH\tR%d\tR%d\t%d" % [ v[:A], v[:B], v[:C] ] }
   @@op << lambda { |v| "OP_LAMBDA\tR%d\tI(%d)\t%d" % [ v[:A], v[:n]+v[:b], v[:c]]}
@@ -288,7 +308,7 @@ class MDB
   @@op << lambda { |v| "OP_CLASS\tR%d\t:%s" % [ v[:A], v[:B] ] }
   @@op << lambda { |v| "OP_MODULE\tR%d\t:%s" % [ v[:A], v[:Bs] ] }
   @@op << lambda { |v| "OP_EXEC\tR%d\tI(%d)" % [ v[:A], v[:n]+v[:Bx] ] }
-  @@op << lambda { |v| "OP_METHOD\tR%d\t:%s" % [ v[:A], v[:B] ] }
+  @@op << lambda { |v| "OP_METHOD\tR%d\tsym(%d)" % [ v[:A], v[:B] ] }
   @@op << lambda { |v| "OP_SCLASS\tR%d\tR%d" % [ v[:A], v[:B] ] }
   @@op << lambda { |v| "OP_TCLASS\tR%d" % v[:A] }
   @@op << lambda { |v| "OP_DEBUG" }
@@ -337,88 +357,106 @@ class MDB
   end
 end
 
-filename = ARGV[0]
-data = File.open(filename, "rb").read
+if __FILE__ == $0
+  filename = ARGV[0]
+  data = File.open(filename, "rb").read
 
-# load_rite_header()
-hdr = MrbHeader.new
-bbuf = BinaryBuffer.new(data)
+  # load_rite_header()
+  hdr = MrbHeader.new
+  bbuf = BinaryBuffer.new(data)
 
-hdr.identifier       = bbuf.readstr(4)
-hdr.binary_version   = bbuf.readstr(4)
-hdr.binary_crc       = bbuf.bin16
-hdr.binary_size      = bbuf.bin32
-hdr.compiler_name    = bbuf.readstr(4)
-hdr.compiler_version = bbuf.readstr(4)
+  hdr.identifier       = bbuf.readstr(4)
+  hdr.binary_version   = bbuf.readstr(4)
+  hdr.binary_crc       = bbuf.bin16
+  hdr.binary_size      = bbuf.bin32
+  hdr.compiler_name    = bbuf.readstr(4)
+  hdr.compiler_version = bbuf.readstr(4)
 
-puts "Rite Binary Identifier: #{hdr.identifier}"
-puts "Rite Binary Version: \"#{hdr.binary_version}\""
-puts "Rite Binary CRC: 0x#{"%x" % hdr.binary_crc}"
-puts "Rite Binary Size: #{hdr.binary_size}"
-puts "Rite Compiler Name: \"#{hdr.compiler_name}\""
-puts "Rite Compiler Version: \"#{hdr.compiler_version}\""
-puts ""
+  puts "Rite Binary Identifier: #{hdr.identifier}"
+  puts "Rite Binary Version: \"#{hdr.binary_version}\""
+  puts "Rite Binary CRC: 0x#{"%x" % hdr.binary_crc}"
+  puts "Rite Binary Size: #{hdr.binary_size}"
+  puts "Rite Compiler Name: \"#{hdr.compiler_name}\""
+  puts "Rite Compiler Version: \"#{hdr.compiler_version}\""
+  puts ""
 
-last_irep = nil
-nsec = 0
-loop do |i|
-  nsec += 1
-  puts "Section \##{nsec}:"
+  $mrb_version = hdr.binary_version.to_i
 
-  sec = Section.new
-  sec.identifier = bbuf.readstr(4)
-  if sec.identifier == "END\0"
-    puts "Section Identifier: END"
-    break
-  end
-  puts "Section Identifier: #{sec.identifier.rstrip}"
+  last_irep = nil
+  nsec = 0
+  loop do |i|
+    nsec += 1
+    puts "Section \##{nsec}:"
 
-  sec.section_size = bbuf.bin32
-  puts "Section Size: #{sec.section_size}"
+    sec = Section.new
+    sec.identifier = bbuf.readstr(4)
+    if sec.identifier == "END\0"
+      puts "Section Identifier: END"
+      break
+    end
+    puts "Section Identifier: #{sec.identifier.rstrip}"
 
-  case sec.identifier
-  when "IREP"
-    irep = IREP.new
-    i = 0  #XXX
+    sec.section_size = bbuf.bin32
+    puts "Section Size: #{sec.section_size}"
 
-    # section header
-    irep.rite_version = bbuf.readstr(4)
-    puts "IREP Rite Instruction Specification Version: #{irep.rite_version}"
+    case sec.identifier
+    when "IREP"
+      irep = IREP.new
+      i = 0  #XXX
 
-    irep.read bbuf
-    last_irep = irep
+      # section header
+      irep.rite_version = bbuf.readstr(4)
+      puts "IREP Rite Instruction Specification Version: #{irep.rite_version}"
 
-  when "LINE"
-    (last_irep.rlen + 1).times { |i|
-      puts "  Lineno Record \##{i}"
+      irep.read bbuf
+      last_irep = irep
 
-      len = bbuf.bin32
-      puts "  Lineno Record Length: #{len}"
+    when "LINE"
+      (last_irep.rlen + 1).times { |i|
+        puts "  Lineno Record \##{i}"
+
+        len = bbuf.bin32
+        puts "  Lineno Record Length: #{len}"
+        fname_len = bbuf.bin16
+        fname = bbuf.readstr(fname_len)
+        puts "  Lineno Filename: #{fname}"
+
+        niseq = bbuf.bin32
+      }
+      # irep->rlen + 1
+      puts "(skip)"
+
+    when "DBG\0"
+      filenames = []
+
       fname_len = bbuf.bin16
-      fname = bbuf.readstr(fname_len)
-      puts "  Lineno Filename: #{fname}"
+      puts "  Number of Filenames: #{fname_len}"
 
-      niseq = bbuf.bin32
-    }
-    # irep->rlen + 1
-    puts "(skip)"
+      fname_len.times { |i|
+        len = bbuf.bin16
+        name = bbuf.readstr(len)
+        puts "    #{name}"
+        filenames << name
+      }
 
-  when "DBG\0"
-    filenames = []
+      last_irep.read_debug_info bbuf, filenames
 
-    fname_len = bbuf.bin16
-    puts "  Number of Filenames: #{fname_len}"
+    when "LVAR"
+      syms_len = bbuf.bin32
+      puts "Number of Local Variables: #{syms_len}"
 
-    fname_len.times { |i|
-      len = bbuf.bin16
-      name = bbuf.readstr(len)
-      puts "    #{name}"
-      filenames << name
-    }
+      syms = []
+      syms_len.times {
+        str_len = bbuf.bin16
+        sym = bbuf.readstr(str_len)
+        syms << sym
+        puts "  #{sym}"
+      }
 
-    last_irep.read_debug_info bbuf, filenames
-  else 
-    puts "(unknown section)"
+      last_irep.read_lv_record bbuf
+    else
+      puts "(unknown section)"
+    end
+    puts
   end
-  puts
 end
